@@ -1,0 +1,2611 @@
+// ════════════════════════════════════════════════════════════════════════
+// EGYMOTELZ — Phase 2: Database Schema (PostgreSQL via Prisma)
+// Multi-tenant SaaS design (per confirmed answer: white-labeled per brand)
+//
+// Design conventions applied to every business table:
+//   - id: UUID primary key
+//   - tenant_id: FK to Tenant, for data isolation (except a few global/catalog tables)
+//   - created_at / updated_at: timestamps
+//   - created_by / updated_by: FK to User (nullable — system/seed data has none)
+//   - status / is_active where applicable
+//   - deleted_at: soft delete (nulls = not deleted)
+//   - Explicit indexes on all FKs and frequently filtered columns
+//   - onDelete: Restrict by default for financial/audit integrity;
+//     Cascade only where child records are meaningless without the parent
+// ════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 0. MULTI-TENANCY ROOT
+// ─────────────────────────────────────────────────────────────────────────
+
+model Tenant {
+  id            String   @id @default(uuid())
+  name          String
+  // Subdomain segment used for resolution, e.g. "egymotelz" -> egymotelz.egymotelz.com
+  // or, for the default tenant, matched directly against the root domain (see TenantDomain).
+  slug          String   @unique
+  isDefault     Boolean  @default(false) @map("is_default") // exactly one tenant should have this true — the root-domain fallback (EGYMOTELZ at launch)
+  logoUrl       String?  @map("logo_url")
+  primaryLocale String   @default("ar") @map("primary_locale")
+  status        TenantStatus @default(ACTIVE)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  domains             TenantDomain[]
+  users               User[]
+  properties          Property[]
+  units               Unit[]
+  ownerApplications   OwnerApplication[]
+  owners              Owner[]
+  bookings            Booking[]
+  guests              Guest[]
+  contractors         Contractor[]
+  contractorApplications ContractorApplication[]
+  contractorProjects  ContractorProject[]
+  hotelManagementCompanies HotelManagementCompany[]
+  hotelManagementCompanyApplications HotelManagementCompanyApplication[]
+  financialPartners   FinancialPartner[]
+  financialTransactions FinancialTransaction[]
+  contracts           Contract[]
+  documents           Document[]
+  supportTickets      SupportTicket[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  activityLogs        ActivityLog[]
+  systemSettings      SystemSetting[]
+  roiScenarios        RoiScenario[]
+  partners             Partner[]
+  partnerUsers         PartnerUser[]
+  partnerServices      PartnerService[]
+  interiorDesignCompanies InteriorDesignCompany[]
+  leads                Lead[]
+  followUps            FollowUp[]
+  partnerReferrals     PartnerReferral[]
+  projectOpportunities ProjectOpportunity[]
+  projectPartnerInvitations ProjectPartnerInvitation[]
+  bids                 Bid[]
+  commissionRules      CommissionRule[]
+  commissions          Commission[]
+  advertisements       Advertisement[]
+  campaigns            Campaign[]
+  maintenanceContracts MaintenanceContract[]
+  maintenanceRequests  MaintenanceRequest[]
+  mediaLibrary        MediaLibraryItem[]
+  contentBlocks       ContentBlock[]
+  otaListings         OtaListing[]
+  discounts           Discount[]
+  coupons             Coupon[]
+  referrals           Referral[]
+
+  @@map("tenants")
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+  CANCELLED
+}
+
+// Every hostname a tenant is reachable on. At launch this holds exactly:
+//   ("egymotelz.com", isPrimary=true), ("www.egymotelz.com", isPrimary=false)
+// both pointing at the isDefault=true Tenant row. Subdomains (brand.egymotelz.com)
+// are resolved separately via Tenant.slug and don't need a row here.
+// Custom-domain onboarding (a brand bringing their own domain) is *modeled*
+// here but its onboarding flow/UI is explicitly out of scope for now.
+model TenantDomain {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  hostname  String   @unique // fully-qualified, lowercase, no port (e.g. "egymotelz.com")
+  isPrimary Boolean  @default(false) @map("is_primary")
+  verifiedAt DateTime? @map("verified_at") // set once DNS/SSL is confirmed for custom domains
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId])
+  @@map("tenant_domains")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 1. IDENTITY, AUTH, RBAC
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id               String    @id @default(uuid())
+  tenantId         String    @map("tenant_id")
+  tenant           Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  email            String
+  phone            String?
+  passwordHash     String    @map("password_hash")
+  // True for every existing/normal email+password account (default,
+  // requires no backfill). False only for a social-only signup, whose
+  // passwordHash holds a random, discarded, never-usable sentinel value —
+  // the existing login()/bcrypt.compare() code path needs no changes.
+  hasPassword      Boolean   @default(true) @map("has_password")
+  fullName         String    @map("full_name")
+  nationalId       String?   @map("national_id") // Egyptian 14-digit ID, validated at app layer
+  preferredLocale  String    @default("ar") @map("preferred_locale")
+
+  emailVerifiedAt  DateTime? @map("email_verified_at")
+  phoneVerifiedAt  DateTime? @map("phone_verified_at")
+
+  status           UserStatus @default(PENDING_VERIFICATION)
+  lastLoginAt      DateTime? @map("last_login_at")
+
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  roles            UserRole[]
+  refreshTokens    RefreshToken[]
+  ownerProfile     Owner?
+  contractorProfile Contractor?
+  hotelManagementCompanyProfile HotelManagementCompany?
+  financialPartnerProfile FinancialPartner?
+  guestProfile     Guest?
+  notifications    Notification[]
+  supportTickets   SupportTicket[] @relation("TicketCreator")
+  sentMessages     Message[]       @relation("MessageSender")
+  receivedMessages Message[]       @relation("MessageRecipient")
+  roiScenarios     RoiScenario[]
+  // Item (referral): a stable, unique code this user can share. Nullable —
+  // generated on first opt-in rather than at signup, so existing users are
+  // unaffected until they engage with the referral feature.
+  referralCode     String?         @unique @map("referral_code")
+  referralsMade    Referral[]      @relation("ReferralsMade")
+  partnerUsers     PartnerUser[]
+  leadsAssigned    Lead[]          @relation("LeadsAssigned")
+  leadEvents       LeadEvent[]
+  followUpsAssigned FollowUp[]
+  partnerReferralEvents PartnerReferralEvent[]
+  identities       UserIdentity[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("users")
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum OAuthProvider {
+  GOOGLE
+  FACEBOOK
+  APPLE
+}
+
+// OAuth identity linking. providerAccountId (the provider's stable
+// subject/identity claim) is the permanent join key — never email.
+// Creating a row here NEVER happens as a side effect of a plain email
+// match against an existing User; that requires the explicit
+// password-confirmation or email-verification-link flow (service layer,
+// Step 4+). This model only records identities that have already been
+// resolved to a specific User by one of: (a) an exact existing
+// (provider, providerAccountId) match, (b) brand-new registration, or
+// (c) completed proof-of-ownership linking.
+model UserIdentity {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  provider          OAuthProvider
+  providerAccountId String  @map("provider_account_id")
+  providerEmail     String? @map("provider_email")
+  emailVerifiedByProvider Boolean @default(false) @map("email_verified_by_provider")
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  lastLoginAt DateTime? @map("last_login_at")
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("user_identities")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  key         String   @unique // guest, owner, contractor, financial_partner, admin, super_admin, finance_staff
+  name        String
+  description String?
+  isGlobal    Boolean  @default(false) @map("is_global") // e.g. super_admin spans tenants
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique // e.g. "finance.transactions.write"
+  description String?
+
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id")
+  permissionId String @map("permission_id")
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id") // role assignment is always scoped to a tenant, even for global roles
+  userId    String   @map("user_id")
+  roleId    String   @map("role_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, userId, roleId])
+  @@index([tenantId])
+  @@map("user_roles")
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  tokenHash  String    @unique @map("token_hash")
+  createdByIp String?  @map("created_by_ip")
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2. OWNER ONBOARDING
+// ─────────────────────────────────────────────────────────────────────────
+
+model Owner {
+  id               String    @id @default(uuid())
+  tenantId         String    @map("tenant_id")
+  tenant           Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId           String    @unique @map("user_id")
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  verificationStatus OwnerVerificationStatus @default(PENDING) @map("verification_status")
+  verifiedAt       DateTime? @map("verified_at")
+  verifiedBy       String?   @map("verified_by")
+
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  properties       Property[]
+  contracts        Contract[]
+  financialTransactions FinancialTransaction[]
+  roiScenarios     RoiScenario[]
+  leadsConverted   Lead[]
+  partnerReferrals PartnerReferral[]
+  projectOpportunities ProjectOpportunity[]
+  maintenanceContracts MaintenanceContract[]
+
+  @@index([tenantId])
+  @@map("owners")
+}
+
+enum OwnerVerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+// Captures the 6-step wizard exactly as the UI defines it.
+model OwnerApplication {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  // created immediately (per confirmed answer: account exists at submission)
+  ownerId  String? @map("owner_id")
+
+  // Step 0 — Owner Info
+  fullName   String @map("full_name")
+  phone      String // international format, see Item 12
+  whatsappNumber String? @map("whatsapp_number")
+  email      String
+  nationalId String @map("national_id")
+
+  // Step 1 — Property Details
+  propertyType PropertyType @map("property_type")
+  cityId       String  @map("city_id")
+  city         City    @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  districtId   String? @map("district_id")
+  district     District? @relation(fields: [districtId], references: [id], onDelete: SetNull)
+  districtFreeText String? @map("district_free_text") // fallback when the chosen city has no matching seeded district yet
+  address      String
+  floorCount   Int @map("floor_count")
+  unitCount    Int @map("unit_count")
+
+  // Step 2 — Readiness (multi-select, replaces the old single `condition` choice)
+  readinessOptions ReadinessOption[] @map("readiness_options")
+  finishingTypes   FinishingType[]   @map("finishing_types")   // only meaningful if FINISHING_REQUIRED is selected
+  furnishingItems  FurnishingItem[]  @map("furnishing_items")  // only meaningful if FURNISHING_REQUIRED is selected
+  notes           String?
+
+  // Step 3 — Financial
+  needsFinancing       TriState @map("needs_financing")
+  needsFurnishingHelp  TriState @map("needs_furnishing_help")
+  budgetAmount         Decimal? @map("budget_amount") @db.Decimal(14, 2)
+  budgetCurrency       String   @default("EGP") @map("budget_currency")
+
+  // Step 5 — Review
+  termsAcceptedAt DateTime? @map("terms_accepted_at")
+
+  status       OwnerApplicationStatus @default(SUBMITTED)
+  submittedAt  DateTime  @default(now()) @map("submitted_at")
+  reviewedAt   DateTime? @map("reviewed_at")
+  reviewedBy   String?   @map("reviewed_by")
+  slaDueAt     DateTime  @map("sla_due_at") // submittedAt + 48h, computed at insert
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  documents  Document[]
+  properties Property[]
+  furnishingRequests FurnishingRequest[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, submittedAt])
+  @@map("owner_applications")
+}
+
+enum OwnerApplicationStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  DOCS_REQUESTED
+  APPROVED
+  REJECTED
+}
+
+enum PropertyType {
+  RESIDENTIAL_BUILDING
+  VILLA
+  FULL_FLOOR
+  APARTMENT
+}
+
+// Item 1: multi-select readiness — a property can be e.g. both
+// FINISHING_REQUIRED and FURNISHING_REQUIRED at once, which the old single
+// PropertyCondition enum couldn't express.
+enum ReadinessOption {
+  FINISHING_REQUIRED
+  FURNISHING_REQUIRED
+  FULLY_READY
+}
+
+enum FinishingType {
+  PAINTING
+  PLUMBING
+  ELECTRICAL
+  FLOORING
+  DOORS_WINDOWS
+  BATHROOMS
+  KITCHEN
+  CEILING
+  FULL_FINISHING
+  OTHER
+}
+
+enum FurnishingItem {
+  BEDROOM
+  LIVING_ROOM
+  KITCHEN_APPLIANCES
+  AIR_CONDITIONING
+  TV
+  CURTAINS
+  COMPLETE_FURNISHING
+}
+
+enum TriState {
+  YES
+  NO
+  PARTIAL
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 3. PROPERTIES & UNITS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Property {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  ownerId              String @map("owner_id")
+  owner                Owner  @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  ownerApplicationId   String? @map("owner_application_id")
+  ownerApplication     OwnerApplication? @relation(fields: [ownerApplicationId], references: [id], onDelete: SetNull)
+
+  propertyType PropertyType @map("property_type")
+  cityId       String  @map("city_id")
+  city         City    @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  districtId   String? @map("district_id")
+  district     District? @relation(fields: [districtId], references: [id], onDelete: SetNull)
+  districtFreeText String? @map("district_free_text")
+  address      String
+  // Item 5: map display + "Nearest" sort. Nullable — set at admin/ops
+  // review time (not part of the owner wizard, which never asks for exact
+  // coordinates), so older/unreviewed properties simply won't sort by
+  // distance or show a pin until this is filled in.
+  latitude     Decimal? @db.Decimal(9, 6)
+  longitude    Decimal? @db.Decimal(9, 6)
+  floorCount   Int @map("floor_count")
+  unitCount    Int @map("unit_count")
+  readinessOptions ReadinessOption[] @map("readiness_options") // owner's declared condition at submission — distinct from readinessStatus below (the internal ops pipeline)
+  finishingTypes   FinishingType[]   @map("finishing_types")
+  furnishingItems  FurnishingItem[]  @map("furnishing_items")
+
+  readinessStatus PropertyReadinessStatus @default(NOT_READY) @map("readiness_status")
+  // Item 17: schema-ready for future assignment — the assignment workflow
+  // itself (an admin UI to link a property to a management company) is
+  // explicitly out of scope for now, per the brief.
+  hotelManagementCompanyId String? @map("hotel_management_company_id")
+  hotelManagementCompany   HotelManagementCompany? @relation(fields: [hotelManagementCompanyId], references: [id], onDelete: SetNull)
+  status          RecordStatus @default(ACTIVE)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  createdBy String?   @map("created_by")
+  updatedBy String?   @map("updated_by")
+  deletedAt DateTime? @map("deleted_at")
+
+  units               Unit[]
+  contracts           Contract[]
+  contractorProjects  ContractorProject[]
+  furnishingRequests  FurnishingRequest[]
+  documents           Document[]
+  discounts           Discount[]
+  partnerReferrals    PartnerReferral[]
+  projectOpportunities ProjectOpportunity[]
+  maintenanceContracts MaintenanceContract[]
+
+  @@index([tenantId])
+  @@index([tenantId, ownerId])
+  @@index([tenantId, readinessStatus])
+  @@index([tenantId, cityId, readinessStatus])
+  @@map("properties")
+}
+
+enum PropertyReadinessStatus {
+  NOT_READY
+  IN_PREPARATION
+  READY
+  PUBLISHED
+}
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+model Unit {
+  id         String @id @default(uuid())
+  tenantId   String @map("tenant_id")
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  propertyId String @map("property_id")
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  unitNumber     String  @map("unit_number")
+  bedrooms       Int
+  bathrooms      Int     @default(1)
+  areaSqm        Decimal? @map("area_sqm") @db.Decimal(8, 2)
+  floorNumber    Int?    @map("floor_number")
+  pricePerNight  Decimal @map("price_per_night") @db.Decimal(10, 2)
+  currency       String  @default("EGP")
+  description    String?
+  badge          UnitBadge? // available_now / recommended / special_offer — data-driven, not hardcoded
+  // Item 5's "Highest Rated" sort needs this column, but no review/rating
+  // input mechanism exists anywhere in the system yet — this is schema-ready
+  // and nullable-safe to sort by, but will read as null for every unit until
+  // an actual review feature is built. Flagged, not silently faked.
+  avgRating      Decimal? @map("avg_rating") @db.Decimal(3, 2)
+
+  status    UnitStatus @default(DRAFT)
+  isActive  Boolean    @default(true) @map("is_active")
+
+  // OTA distribution eligibility — deliberately separate from `status`
+  // above. A unit can be internally PUBLISHED (bookable on EgyMotelz
+  // directly) without being OTA-eligible; this only flips to
+  // READY_FOR_DISTRIBUTION once an admin has explicitly signed off
+  // (otaApprovedAt/By) on top of all the other internal conditions being
+  // met. It does not by itself mean the unit is live on any external
+  // channel — see OtaListing for actual per-channel distribution status.
+  otaEligibilityStatus OtaEligibilityStatus @default(NOT_ELIGIBLE) @map("ota_eligibility_status")
+  otaApprovedAt        DateTime?            @map("ota_approved_at")
+  otaApprovedBy        String?              @map("ota_approved_by")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  createdBy String?   @map("created_by")
+  updatedBy String?   @map("updated_by")
+  deletedAt DateTime? @map("deleted_at")
+
+  images       UnitImage[]
+  amenities    UnitAmenity[]
+  availability AvailabilityCalendar[]
+  bookings     Booking[]
+  otaListings  OtaListing[]
+  discounts    Discount[]
+  advertisements       Advertisement[]
+  maintenanceRequests  MaintenanceRequest[]
+  maintenanceContractUnits MaintenanceContractUnit[]
+
+  @@index([tenantId])
+  @@index([tenantId, propertyId])
+  @@index([tenantId, status, isActive])
+  @@index([tenantId, otaEligibilityStatus])
+  @@map("units")
+}
+
+enum UnitStatus {
+  DRAFT
+  NOT_READY
+  READY
+  PUBLISHED
+  INACTIVE
+}
+
+enum OtaEligibilityStatus {
+  NOT_ELIGIBLE
+  READY_FOR_DISTRIBUTION
+}
+
+enum UnitBadge {
+  AVAILABLE_NOW
+  RECOMMENDED
+  SPECIAL_OFFER
+}
+
+model UnitImage {
+  id        String   @id @default(uuid())
+  unitId    String   @map("unit_id")
+  unit      Unit     @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  url       String
+  altText   String?  @map("alt_text")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // OTA-readiness condition #3 ("professional photography completed and
+  // approved"). isProfessional flags intent (was this shot as part of the
+  // professional photography step, vs. an owner's own snapshot);
+  // reviewStatus is the admin's actual approval — both default to the
+  // existing behavior (a plain, unreviewed image) so no existing row's
+  // meaning changes.
+  isProfessional Boolean           @default(false) @map("is_professional")
+  reviewStatus   ImageReviewStatus @default(PENDING) @map("review_status")
+  reviewedBy     String?           @map("reviewed_by")
+  reviewedAt     DateTime?         @map("reviewed_at")
+
+  advertisementCoverFor Advertisement[] @relation("AdvertisementCoverImage")
+  advertisementGalleryEntries AdvertisementImage[]
+
+  @@index([unitId])
+  @@map("unit_images")
+}
+
+enum ImageReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// Global catalog — amenities are shared across tenants (not tenant-scoped)
+// Global geo catalog (not tenant-scoped, same rationale as Amenity below):
+// every tenant/brand shares the same map of Egypt regardless of which
+// properties/units they individually list.
+model Governorate {
+  id     String @id @default(uuid())
+  key    String @unique // stable slug, e.g. "cairo-governorate", "south-sinai" — same convention as City.key
+  nameAr String @map("name_ar")
+  nameEn String @map("name_en")
+  sortOrder Int @default(0) @map("sort_order")
+
+  cities City[]
+
+  @@map("governorates")
+}
+
+model City {
+  id      String @id @default(uuid())
+  key     String @unique // stable slug, e.g. "cairo", "sharm-el-sheikh"
+  nameAr  String @map("name_ar")
+  nameEn  String @map("name_en")
+  isTouristCity Boolean @default(false) @map("is_tourist_city")
+  sortOrder Int @default(0) @map("sort_order")
+
+  // Nullable so this migration is purely additive — every existing City row
+  // (and every existing query/endpoint reading it) keeps working unchanged
+  // the instant this column is added, before the seed step below ever runs.
+  // "New Administrative Capital" is deliberately grouped under Cairo
+  // Governorate here as a product/UI grouping decision, not a claim that it
+  // IS a governorate — it remains a City row like any other; if its real
+  // administrative classification changes later, only its governorateId
+  // value needs updating, not this schema.
+  governorateId String? @map("governorate_id")
+  governorate   Governorate? @relation(fields: [governorateId], references: [id], onDelete: SetNull)
+
+  districts         District[]
+  ownerApplications OwnerApplication[]
+  properties        Property[]
+  contractors               Contractor[]
+  contractorApplications    ContractorApplication[]
+  hotelManagementCompanyApplications HotelManagementCompanyApplication[]
+  partners                  Partner[]
+  leads                     Lead[]
+  projectOpportunities      ProjectOpportunity[]
+  interiorDesignServiceFor  InteriorDesignCompany[] @relation("InteriorDesignServiceCities")
+
+  @@index([governorateId])
+  @@map("cities")
+}
+
+model District {
+  id     String @id @default(uuid())
+  cityId String @map("city_id")
+  city   City   @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  nameAr String @map("name_ar")
+  nameEn String @map("name_en")
+
+  ownerApplications OwnerApplication[]
+  properties        Property[]
+
+  @@unique([cityId, nameEn])
+  @@map("districts")
+}
+
+model Amenity {
+  id       String @id @default(uuid())
+  key      String @unique
+  labelAr  String @map("label_ar")
+  labelEn  String @map("label_en")
+  icon     String?
+
+  units UnitAmenity[]
+
+  @@map("amenities")
+}
+
+model UnitAmenity {
+  unitId    String @map("unit_id")
+  amenityId String @map("amenity_id")
+  unit      Unit    @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  amenity   Amenity @relation(fields: [amenityId], references: [id], onDelete: Cascade)
+
+  @@id([unitId, amenityId])
+  @@map("unit_amenities")
+}
+
+// Real-time availability engine (per confirmed answer: live booking w/ locking)
+model AvailabilityCalendar {
+  id        String   @id @default(uuid())
+  unitId    String   @map("unit_id")
+  unit      Unit     @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  date      DateTime @db.Date
+  status    AvailabilityStatus @default(AVAILABLE)
+  bookingId String?  @map("booking_id")
+  booking   Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // DB-level guarantee: one status row per unit per night — this IS the
+  // double-booking lock. Booking confirmation must upsert these rows inside
+  // a single transaction with SELECT ... FOR UPDATE / serializable isolation.
+  @@unique([unitId, date])
+  @@index([unitId, date, status])
+  @@map("availability_calendar")
+}
+
+enum AvailabilityStatus {
+  AVAILABLE
+  HELD
+  BOOKED
+  BLOCKED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 3b. OTA DISTRIBUTION (internal readiness/listing tracking — see
+//     lib/adapters/*ota* for the separate, currently-mocked concern of
+//     actually talking to Booking.com/Airbnb's real APIs)
+// ─────────────────────────────────────────────────────────────────────────
+
+// Per-channel distribution status for a unit. Deliberately separate from
+// Unit.otaEligibilityStatus: a unit becoming READY_FOR_DISTRIBUTION doesn't
+// mean it's listed anywhere yet — a row here (or its absence) is the source
+// of truth for "is this actually live on Booking.com/Airbnb right now".
+model OtaListing {
+  id                String           @id @default(uuid())
+  tenantId          String           @map("tenant_id")
+  tenant            Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  unitId            String           @map("unit_id")
+  unit              Unit             @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  channel           OtaChannel
+  status            OtaListingStatus @default(NOT_LISTED)
+  // Only ever populated once a real channel adapter exists and actually
+  // creates a listing — never set by mock/dev code.
+  externalListingId String?          @map("external_listing_id")
+  lastSyncedAt      DateTime?        @map("last_synced_at")
+  lastSyncError     String?          @map("last_sync_error")
+  createdBy         String?          @map("created_by")
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  @@unique([unitId, channel])
+  @@index([tenantId])
+  @@index([tenantId, channel, status])
+  @@map("ota_listings")
+}
+
+enum OtaChannel {
+  BOOKING_COM
+  AIRBNB
+}
+
+enum OtaListingStatus {
+  NOT_LISTED
+  PENDING_PUBLISH
+  PUBLISHED
+  PAUSED
+  ERROR
+  DELISTED
+}
+
+// Shared by Discount and Coupon.
+enum DiscountType {
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+// Property/unit-scoped promotion, no code required from the guest.
+model Discount {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  // Exactly one of unitId/propertyId should be set in practice (enforced at
+  // the service layer, not the DB) — unit-level for a single listing,
+  // property-level to apply across all of a property's units.
+  unitId     String?   @map("unit_id")
+  unit       Unit?     @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  propertyId String?   @map("property_id")
+  property   Property? @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  type              DiscountType
+  value             Decimal      @db.Decimal(10, 2) // percentage (0–100) or fixed amount, per `type`
+  startDate         DateTime     @map("start_date")
+  endDate           DateTime     @map("end_date")
+  isActive          Boolean      @default(true) @map("is_active")
+  minBookingAmount  Decimal?     @map("min_booking_amount") @db.Decimal(10, 2)
+  maxDiscountAmount Decimal?     @map("max_discount_amount") @db.Decimal(10, 2) // cap, percentage type only
+  // Per confirmed answer: discounts must not silently remove the OTA
+  // markup. False means "discount applies to the base price only, the OTA
+  // markup is added back on top afterward for OTA-channel bookings";
+  // true is an explicit opt-in to also discount the markup portion.
+  appliesToOtaPrice Boolean  @default(false) @map("applies_to_ota_price")
+  createdBy         String?  @map("created_by")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId, isActive])
+  @@index([tenantId, unitId])
+  @@index([tenantId, propertyId])
+  @@map("discounts")
+}
+
+// Code-based promotion, redeemed by guests at booking time.
+model Coupon {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  code String
+
+  type              DiscountType
+  value             Decimal      @db.Decimal(10, 2)
+  startDate         DateTime     @map("start_date")
+  endDate           DateTime     @map("end_date")
+  isActive          Boolean      @default(true) @map("is_active")
+  minBookingAmount  Decimal?     @map("min_booking_amount") @db.Decimal(10, 2)
+  maxDiscountAmount Decimal?     @map("max_discount_amount") @db.Decimal(10, 2)
+  maxUses           Int?         @map("max_uses") // total redemptions across all guests, null = unlimited
+  // Per-guest cap: enforced against Guest.id, since Guest.userId is
+  // nullable (guests may book without an account) — see CouponRedemption.
+  // This means two bookings by the same real person under different
+  // contact details will be counted as different guests; a pre-existing
+  // limitation of the guest model, not something this feature resolves.
+  maxUsesPerGuest   Int?         @map("max_uses_per_guest")
+  usesCount         Int          @default(0) @map("uses_count")
+  appliesToOtaPrice Boolean      @default(false) @map("applies_to_ota_price")
+  createdBy         String?      @map("created_by")
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+
+  redemptions CouponRedemption[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, isActive])
+  @@map("coupons")
+}
+
+// Audit trail of an actual redemption — separate from Coupon.usesCount
+// (a running counter) so the exact amount applied per booking is preserved
+// even if the coupon's own value/type is edited later.
+model CouponRedemption {
+  id       String  @id @default(uuid())
+  couponId String  @map("coupon_id")
+  coupon   Coupon  @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  bookingId String @unique @map("booking_id")
+  booking  Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  guestId  String? @map("guest_id")
+  guest    Guest?  @relation(fields: [guestId], references: [id], onDelete: SetNull)
+
+  discountAmount Decimal  @map("discount_amount") @db.Decimal(10, 2) // actual amount applied, server-computed
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([couponId])
+  @@index([guestId])
+  @@map("coupon_redemptions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 3c. REFERRAL
+// ─────────────────────────────────────────────────────────────────────────
+
+model Referral {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  referrerUserId String @map("referrer_user_id")
+  referrerUser   User   @relation("ReferralsMade", fields: [referrerUserId], references: [id], onDelete: Cascade)
+
+  // Nullable: a referral exists (code shared) before anyone has necessarily
+  // booked yet — refereeGuestId/bookingId are only set once someone
+  // actually uses the code on a booking.
+  refereeGuestId String? @map("referee_guest_id")
+  refereeGuest   Guest?  @relation(fields: [refereeGuestId], references: [id], onDelete: SetNull)
+  bookingId      String? @unique @map("booking_id")
+  booking        Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  status ReferralStatus @default(PENDING)
+
+  // Snapshotted at qualification time from the SystemSetting("referral.reward")
+  // value in effect then — so changing the configured reward later never
+  // retroactively alters an already-qualified referral.
+  rewardAmount   Decimal?  @map("reward_amount") @db.Decimal(10, 2)
+  rewardCurrency String?   @map("reward_currency")
+  qualifiedAt    DateTime? @map("qualified_at")
+  rewardedAt     DateTime? @map("rewarded_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId, referrerUserId])
+  @@index([tenantId, status])
+  @@map("referrals")
+}
+
+enum ReferralStatus {
+  PENDING
+  QUALIFIED
+  REWARDED
+  EXPIRED
+  CANCELLED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 4. GUESTS & BOOKINGS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Guest {
+  id          String  @id @default(uuid())
+  tenantId    String  @map("tenant_id")
+  tenant      Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId      String? @unique @map("user_id") // nullable: guests may book without creating an account
+  user        User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  fullName    String  @map("full_name")
+  phone       String // international format, see Item 12
+  whatsappNumber String? @map("whatsapp_number")
+  email       String
+  nationality String
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  bookings Booking[]
+  couponRedemptions CouponRedemption[]
+  referrals         Referral[]
+
+  @@index([tenantId])
+  @@index([tenantId, phone])
+  @@map("guests")
+}
+
+model Booking {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  guestId String @map("guest_id")
+  guest   Guest  @relation(fields: [guestId], references: [id], onDelete: Restrict)
+
+  unitId  String @map("unit_id") // per confirmed answer: real engine, unit chosen up front
+  unit    Unit   @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  checkIn      DateTime @map("check_in") @db.Date
+  checkOut     DateTime @map("check_out") @db.Date
+  guestCount   Int      @map("guest_count")
+  notes        String?
+
+  // totalPrice remains the single final charged amount (unchanged meaning,
+  // unchanged column) — the fields below are the new server-computed
+  // breakdown behind that number. All nullable/defaulted so existing rows
+  // remain valid: basePrice null and otaMarkupAmount/discountAmount 0 for
+  // any booking created before this feature existed.
+  totalPrice   Decimal? @map("total_price") @db.Decimal(10, 2)
+  currency     String   @default("EGP")
+
+  basePrice       Decimal? @map("base_price") @db.Decimal(10, 2)
+  // Per confirmed answer: only ever non-zero when channel is BOOKING_COM or
+  // AIRBNB — direct bookings must never carry the OTA markup.
+  otaMarkupAmount Decimal  @default(0) @map("ota_markup_amount") @db.Decimal(10, 2)
+  discountAmount  Decimal  @default(0) @map("discount_amount") @db.Decimal(10, 2)
+  channel         BookingChannel @default(DIRECT)
+
+  // Item 6: payment integration. Modular by design — see lib/adapters/payment.adapter.ts.
+  paymentStatus    PaymentStatus @default(PENDING) @map("payment_status")
+  paymentReference String?       @map("payment_reference") // the mock/real gateway's transaction id
+  paymentMethod    String?       @map("payment_method")     // e.g. "mock_card" until a real gateway is wired in
+
+  status       BookingStatus @default(PENDING)
+  holdExpiresAt DateTime? @map("hold_expires_at") // for temporary inventory holds before confirmation
+
+  termsAcceptedAt DateTime @map("terms_accepted_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  availabilityDays AvailabilityCalendar[]
+  financialTransactions FinancialTransaction[]
+  couponRedemption CouponRedemption?
+  referral         Referral?
+
+  @@index([tenantId, status])
+  @@index([tenantId, unitId, checkIn, checkOut])
+  @@index([tenantId, channel])
+  @@map("bookings")
+}
+
+enum BookingChannel {
+  DIRECT
+  BOOKING_COM
+  AIRBNB
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum BookingStatus {
+  PENDING
+  CONTACTED
+  CONFIRMED
+  CHECKED_IN
+  CHECKED_OUT   // once here, guest is colloquially "the tenant" — no separate table needed
+  DECLINED
+  CANCELLED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 5. CONTRACTOR / FURNISHING PORTAL (internal-only)
+// ─────────────────────────────────────────────────────────────────────────
+
+model Contractor {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId   String @unique @map("user_id")
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  companyName    String  @map("company_name")
+  contractorName String? @map("contractor_name")
+  whatsappNumber String? @map("whatsapp_number")
+  commercialRegistrationNumber String? @map("commercial_registration_number")
+  taxCardNumber  String? @map("tax_card_number")
+  specialization String?
+  governorate    String?
+  cityId         String? @map("city_id")
+  city           City?   @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  yearsOfExperience Int? @map("years_of_experience")
+  portfolio      String? @db.Text
+
+  verificationStatus VerificationStatus @default(PENDING) @map("verification_status")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  projects ContractorProject[]
+  applications ContractorApplication[]
+  partner  Partner?
+
+  @@index([tenantId])
+  @@index([tenantId, cityId])
+  @@map("contractors")
+}
+
+// Item 10: full contractor self-registration, mirroring the OwnerApplication
+// submit-then-review pattern (account created immediately, same convention
+// established for owners — see docs/04-business-logic.md).
+model ContractorApplication {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  contractorId String? @map("contractor_id")
+  contractor   Contractor? @relation(fields: [contractorId], references: [id], onDelete: SetNull)
+
+  companyName    String @map("company_name")
+  contractorName String @map("contractor_name")
+  phone          String // international format, see Item 12
+  whatsappNumber String? @map("whatsapp_number")
+  email          String
+  commercialRegistrationNumber String @map("commercial_registration_number")
+  taxCardNumber  String @map("tax_card_number")
+  specialization String
+  governorate    String
+  cityId         String @map("city_id")
+  city           City   @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  yearsOfExperience Int @map("years_of_experience")
+  portfolio      String? @db.Text
+
+  status       ApplicationReviewStatus @default(SUBMITTED)
+  submittedAt  DateTime  @default(now()) @map("submitted_at")
+  reviewedAt   DateTime? @map("reviewed_at")
+  reviewedBy   String?   @map("reviewed_by")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  documents Document[]
+
+  @@index([tenantId, status])
+  @@map("contractor_applications")
+}
+
+// Item 17: approved companies become selectable entities for future
+// assignment to property owners — this model IS that selectable entity;
+// the assignment workflow itself is intentionally not built yet (out of
+// scope per the brief — "become available... for future assignment"), but
+// Property.hotelManagementCompanyId below makes that a schema-only addition
+// later rather than a migration.
+model HotelManagementCompany {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId   String @unique @map("user_id")
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  companyName String @map("company_name")
+  verificationStatus VerificationStatus @default(PENDING) @map("verification_status")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  applications HotelManagementCompanyApplication[]
+  managedProperties Property[]
+  partner  Partner?
+
+  @@index([tenantId])
+  @@map("hotel_management_companies")
+}
+
+model HotelManagementCompanyApplication {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  companyId String? @map("company_id")
+  company   HotelManagementCompany? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  companyName    String @map("company_name")
+  commercialRegistrationNumber String @map("commercial_registration_number")
+  taxCardNumber  String @map("tax_card_number")
+  companyAddress String @map("company_address")
+  governorate    String
+  cityId         String @map("city_id")
+  city           City   @relation(fields: [cityId], references: [id], onDelete: Restrict)
+
+  contactPerson  String @map("contact_person")
+  jobTitle       String @map("job_title")
+  phone          String // international format, see Item 12
+  whatsappNumber String? @map("whatsapp_number")
+  email          String
+  companyWebsite String? @map("company_website")
+
+  yearsOfExperience Int @map("years_of_experience")
+  numberOfEmployees Int @map("number_of_employees")
+  propertiesManagedCount   Int @map("properties_managed_count")
+  propertiesFurnishedCount Int @map("properties_furnished_count")
+  propertiesOperatedCount  Int @map("properties_operated_count")
+  propertyTypesManaged PropertyTypeManaged[] @map("property_types_managed")
+
+  areasOfOperation String? @db.Text @map("areas_of_operation")
+  availableServices String? @db.Text @map("available_services")
+  previousClients  String? @db.Text @map("previous_clients")
+  companyDescription String? @db.Text @map("company_description")
+
+  status       ApplicationReviewStatus @default(SUBMITTED)
+  submittedAt  DateTime  @default(now()) @map("submitted_at")
+  reviewedAt   DateTime? @map("reviewed_at")
+  reviewedBy   String?   @map("reviewed_by")
+  reviewNote   String?   @map("review_note") // used for the "Request More Information" outcome
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  documents Document[]
+
+  @@index([tenantId, status])
+  @@map("hotel_management_company_applications")
+}
+
+enum PropertyTypeManaged {
+  APARTMENTS
+  BUILDINGS
+  HOTELS
+  SERVICED_APARTMENTS
+  RESORTS
+  VILLAS
+  OTHER
+}
+
+// Shared by ContractorApplication and HotelManagementCompanyApplication —
+// item 17 explicitly asks for Approve / Reject / Request More Information,
+// which OwnerApplicationStatus's similarly-shaped-but-differently-named
+// DOCS_REQUESTED doesn't cleanly map to, so this is a distinct enum rather
+// than force-reusing OwnerApplicationStatus.
+enum ApplicationReviewStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  MORE_INFO_REQUESTED
+  APPROVED
+  REJECTED
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model ContractorProject {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  propertyId   String @map("property_id")
+  property     Property @relation(fields: [propertyId], references: [id], onDelete: Restrict)
+  contractorId String @map("contractor_id")
+  contractor   Contractor @relation(fields: [contractorId], references: [id], onDelete: Restrict)
+
+  currentStage ProjectStage @default(DESIGN) @map("current_stage")
+  progressPct  Int          @default(0) @map("progress_pct") // derived from stage+tasks; not freely editable by API
+
+  startedAt   DateTime  @default(now()) @map("started_at")
+  completedAt DateTime? @map("completed_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tasks ContractorTask[]
+
+  @@index([tenantId])
+  @@index([tenantId, currentStage])
+  @@map("contractor_projects")
+}
+
+enum ProjectStage {
+  DESIGN
+  CONSTRUCTION
+  FURNISHING
+  INSPECTION
+  COMPLETE
+}
+
+model ContractorTask {
+  id        String @id @default(uuid())
+  projectId String @map("project_id")
+  project   ContractorProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  title      String
+  status     TaskStatus @default(TODO)
+  assignedTo String?    @map("assigned_to")
+  dueDate    DateTime?  @map("due_date") @db.Date
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([projectId])
+  @@map("contractor_tasks")
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+model FurnishingRequest {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+
+  ownerApplicationId String? @map("owner_application_id")
+  ownerApplication   OwnerApplication? @relation(fields: [ownerApplicationId], references: [id], onDelete: SetNull)
+  propertyId         String? @map("property_id")
+  property           Property? @relation(fields: [propertyId], references: [id], onDelete: SetNull)
+
+  status       RequestStatus @default(OPEN)
+  budgetAmount Decimal?      @map("budget_amount") @db.Decimal(14, 2)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId])
+  @@map("furnishing_requests")
+}
+
+enum RequestStatus {
+  OPEN
+  IN_PROGRESS
+  FULFILLED
+  CANCELLED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 6. FINANCE (internal, highest sensitivity) + EXTERNAL FINANCIAL PARTNERS
+// ─────────────────────────────────────────────────────────────────────────
+
+// NEW per confirmed answer #3: external investor/lender with their own
+// restricted login — separate entity from internal finance staff.
+model FinancialPartner {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId   String @unique @map("user_id")
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  companyName        String @map("company_name")
+  verificationStatus VerificationStatus @default(PENDING) @map("verification_status")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  financialTransactions FinancialTransaction[]
+
+  @@index([tenantId])
+  @@map("financial_partners")
+}
+
+model Contract {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  ownerId    String @map("owner_id")
+  owner      Owner  @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  propertyId String? @map("property_id")
+  property   Property? @relation(fields: [propertyId], references: [id], onDelete: SetNull)
+
+  commissionRate Decimal @map("commission_rate") @db.Decimal(5, 2) // e.g. 20.00 = 20%
+  startDate      DateTime @map("start_date") @db.Date
+  endDate        DateTime? @map("end_date") @db.Date
+  termsUrl       String?  @map("terms_url")
+  status         ContractStatus @default(ACTIVE)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId, ownerId])
+  @@map("contracts")
+}
+
+enum ContractStatus {
+  ACTIVE
+  EXPIRED
+  TERMINATED
+}
+
+model FinancialTransaction {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  ownerId            String? @map("owner_id")
+  owner              Owner? @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  bookingId          String? @map("booking_id")
+  booking            Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  financialPartnerId String? @map("financial_partner_id")
+  financialPartner   FinancialPartner? @relation(fields: [financialPartnerId], references: [id], onDelete: SetNull)
+
+  type     TransactionType
+  amount   Decimal @db.Decimal(14, 2)
+  currency String  @default("EGP")
+  method   PaymentMethod
+  status   TransactionStatus @default(PENDING)
+
+  occurredAt DateTime @map("occurred_at")
+  recordedBy String?  @map("recorded_by")
+  note       String?
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId, ownerId])
+  @@index([tenantId, type, status])
+  @@map("financial_transactions")
+}
+
+enum TransactionType {
+  PAYOUT
+  COMMISSION
+  MANUAL
+  INVESTMENT
+}
+
+enum PaymentMethod {
+  BANK_TRANSFER
+  CASH
+  DEDUCTION
+  OTHER
+}
+
+enum TransactionStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  REVERSED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 7. DOCUMENTS, SUPPORT, MESSAGING, NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Document {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  ownerApplicationId String? @map("owner_application_id")
+  ownerApplication   OwnerApplication? @relation(fields: [ownerApplicationId], references: [id], onDelete: Cascade)
+  propertyId         String? @map("property_id")
+  property           Property? @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  contractorApplicationId String? @map("contractor_application_id")
+  contractorApplication   ContractorApplication? @relation(fields: [contractorApplicationId], references: [id], onDelete: Cascade)
+  hotelManagementCompanyApplicationId String? @map("hotel_management_company_application_id")
+  hotelManagementCompanyApplication   HotelManagementCompanyApplication? @relation(fields: [hotelManagementCompanyApplicationId], references: [id], onDelete: Cascade)
+  partnerId               String? @map("partner_id")
+  partner                 Partner? @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  projectOpportunityId    String? @map("project_opportunity_id")
+  projectOpportunity      ProjectOpportunity? @relation(fields: [projectOpportunityId], references: [id], onDelete: Cascade)
+  bidId                   String? @map("bid_id")
+  bid                     Bid? @relation(fields: [bidId], references: [id], onDelete: Cascade)
+
+  type       DocumentType
+  fileUrl    String  @map("file_url")
+  mimeType   String  @map("mime_type")
+  sizeBytes  Int     @map("size_bytes")
+
+  status     DocumentStatus @default(PENDING)
+  verifiedAt DateTime? @map("verified_at")
+  verifiedBy String?   @map("verified_by")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId])
+  @@index([tenantId, ownerApplicationId])
+  @@map("documents")
+}
+
+enum DocumentType {
+  NATIONAL_ID
+  PROOF_OF_OWNERSHIP
+  INHERITANCE_DOCUMENT
+  POWER_OF_ATTORNEY
+  COMMERCIAL_REGISTRATION
+  TAX_CARD
+  PREVIOUS_PROJECTS
+  COMPANY_PROFILE
+  OPERATING_LICENSE
+  OTHER
+}
+
+enum DocumentStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model SupportTicket {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId   String @map("user_id")
+  user     User   @relation("TicketCreator", fields: [userId], references: [id], onDelete: Cascade)
+
+  subject  String
+  status   TicketStatus @default(OPEN)
+  priority TicketPriority @default(NORMAL)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  messages Message[]
+  maintenanceRequest MaintenanceRequest?
+
+  @@index([tenantId, status])
+  @@map("support_tickets")
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+model Message {
+  id          String  @id @default(uuid())
+  ticketId    String? @map("ticket_id")
+  ticket      SupportTicket? @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderId    String  @map("sender_id")
+  sender      User    @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  recipientId String  @map("recipient_id")
+  recipient   User    @relation("MessageRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+
+  body   String
+  readAt DateTime? @map("read_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([ticketId])
+  @@index([recipientId, readAt])
+  @@map("messages")
+}
+
+model Notification {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId   String @map("user_id")
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type       String // e.g. "owner_application.approved", "booking.confirmed"
+  payload    Json
+  sentVia    NotificationChannel[]
+  readAt     DateTime? @map("read_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, userId, readAt])
+  @@map("notifications")
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  IN_APP
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 8. SYSTEM: AUDIT, ACTIVITY, SETTINGS, TRANSLATIONS, MEDIA, CMS
+// ─────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id       String  @id @default(uuid())
+  tenantId String? @map("tenant_id") // nullable: platform-level (super_admin) actions span tenants
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+  actorId    String? @map("actor_id")
+  action     String  // e.g. "owner_application.status_changed"
+  entityType String  @map("entity_type")
+  entityId   String  @map("entity_id")
+  beforeJson Json?   @map("before_json")
+  afterJson  Json?   @map("after_json")
+  ipAddress  String? @map("ip_address")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, entityType, entityId])
+  @@index([actorId])
+  @@map("audit_logs")
+}
+
+model ActivityLog {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userId   String? @map("user_id")
+
+  action   String
+  metadata Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, userId])
+  @@map("activity_logs")
+}
+
+// Two new keys used by the OTA pricing feature (no schema change needed —
+// this model already supported arbitrary admin-configurable values):
+//   "ota.markup_usd"   -> { "value": 11 }                          — the $11 OTA markup, admin-editable
+//   "fx.usd_to_egp"     -> { "rate": <number>, "updatedAt": <iso> } — current USD->EGP rate, admin-editable
+// Per confirmed decision: MVP keeps a single current rate here (no history
+// table). If historical/rate-provider tracking is needed later, the
+// upgrade path is additive — introduce a dedicated ExchangeRate model
+// (rate + effectiveAt rows) and have PricingService read from that instead;
+// nothing about this SystemSetting-based approach needs to be torn out,
+// since Booking.otaMarkupAmount already stores the *computed* EGP amount
+// per booking rather than the raw rate, so past bookings are unaffected
+// either way.
+model SystemSetting {
+  id       String  @id @default(uuid())
+  tenantId String? @map("tenant_id") // nullable = platform-wide default, overridable per tenant
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  key      String
+  value    Json
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, key])
+  @@map("system_settings")
+}
+
+model Translation {
+  id     String @id @default(uuid())
+  key    String
+  locale String
+  value  String
+
+  @@unique([key, locale])
+  @@map("translations")
+}
+
+model MediaLibraryItem {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  url        String
+  type       String // image/pdf/etc
+  uploadedBy String? @map("uploaded_by")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([tenantId])
+  @@map("media_library")
+}
+
+// Optional lightweight CMS for the About page copy (not required for v1,
+// included so "من نحن" text can be edited without a redeploy if desired)
+model ContentBlock {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  key    String
+  locale String
+  body   String
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tenantId, key, locale])
+  @@map("content_blocks")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 9. OWNER ROI CALCULATOR (persistence is optional — calc itself stays
+//    client-side per Phase 1 spec; this only stores saved scenarios)
+// ─────────────────────────────────────────────────────────────────────────
+
+model RoiScenario {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  ownerId  String @map("owner_id")
+  owner    Owner  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  userId   String? @map("user_id")
+  user     User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  inputs   Json // { units, rate, occupancyPct, commissionPct, furnishingCost }
+  computed Json // { gross, commission, net, annual, paybackMonths }
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, ownerId])
+  @@map("roi_scenarios")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 4. PARTNER MARKETPLACE — CRM, TWO-WAY REFERRAL, PROJECT OPPORTUNITY,
+//    BIDDING, COMMISSION LEDGER
+//
+// Partner is a NEW commercial/CRM identity layered over existing
+// operational identities (Contractor, HotelManagementCompany) via nullable
+// unique FKs — it does not replace, rename, or restructure either. See
+// InteriorDesignCompany for a type with no legacy system to wrap.
+//
+// This "Referral" concept is intentionally NOT the existing `Referral`
+// model above (that one is a guest-booking referral, a different, live,
+// unrelated business flow) — hence PartnerReferral, a distinct name.
+// ─────────────────────────────────────────────────────────────────────────
+
+enum PartnerType {
+  CONTRACTOR
+  HOTEL_MANAGEMENT
+  INTERIOR_DESIGN
+  FURNITURE
+  MAINTENANCE
+  CLEANING
+  APPLIANCES
+  REAL_ESTATE
+  HOSPITALITY_SERVICES
+  OTHER
+}
+
+// Deliberately a separate enum from PartnerType, not a reuse of it — "what
+// kind of company" vs "what services it actually offers" are different
+// questions. Same member values today by convention only; this is what
+// lets the two diverge later without a migration touching any other
+// marketplace model.
+enum PartnerServiceType {
+  CONTRACTOR
+  HOTEL_MANAGEMENT
+  INTERIOR_DESIGN
+  FURNITURE
+  MAINTENANCE
+  CLEANING
+  APPLIANCES
+  REAL_ESTATE
+  HOSPITALITY_SERVICES
+  OTHER
+}
+
+enum PartnerVerificationStatus {
+  PENDING_REVIEW
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  SUSPENDED
+  INACTIVE
+}
+
+model Partner {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  partnerType        PartnerType
+  // Sole authoritative legal/commercial verification status. Specialized
+  // operational profiles (InteriorDesignCompany, etc.) deliberately have no
+  // verification field of their own. Future service-specific sub-reviews
+  // (portfolioReviewed, licenseReviewed, ...) are a deferred extension
+  // point, not implemented now.
+  verificationStatus PartnerVerificationStatus @default(PENDING_REVIEW) @map("verification_status")
+
+  // Item 3: permanent, immutable, assigned once on approval (e.g.
+  // "EGY-P-00027") — distinct from PartnerReferral.referralCode, which is
+  // generated per individual referral event, not per Partner. Used to
+  // build the referral URL (?partner=EGY-P-00027). Nullable until approved
+  // — a PENDING_REVIEW partner has no code yet.
+  partnerCode String? @unique @map("partner_code")
+
+  companyName    String  @map("company_name")
+  legalName      String? @map("legal_name")
+  phone          String
+  whatsappNumber String? @map("whatsapp_number")
+  email          String
+  website        String?
+  governorate    String?
+  cityId         String? @map("city_id")
+  city           City?   @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  address        String?
+  yearsOfExperience Int? @map("years_of_experience")
+  employeeCount     Int? @map("employee_count")
+  companyDescription String? @db.Text @map("company_description")
+
+  // Nullable, unique links to existing operational identities — set for
+  // exactly one (or neither, for a type with no legacy analogue) depending
+  // on partnerType. Existing Contractor/HotelManagementCompany rows,
+  // dashboards, auth, and workflows are entirely untouched by this link.
+  contractorId String? @unique @map("contractor_id")
+  contractor   Contractor? @relation(fields: [contractorId], references: [id], onDelete: SetNull)
+  hotelManagementCompanyId String? @unique @map("hotel_management_company_id")
+  hotelManagementCompany   HotelManagementCompany? @relation(fields: [hotelManagementCompanyId], references: [id], onDelete: SetNull)
+
+  interiorDesignCompany InteriorDesignCompany?
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  // Soft-delete only, no hard-delete endpoint ever exposed — combined with
+  // Restrict below on every history-bearing relation, this is what
+  // guarantees deleting/deactivating a Partner can never orphan or destroy
+  // commercial history. Use SUSPENDED/INACTIVE verificationStatus instead
+  // of deletion.
+  deletedAt DateTime? @map("deleted_at")
+
+  users       PartnerUser[]
+  services    PartnerService[]
+  leads       Lead[]
+  referrals   PartnerReferral[]
+  invitations ProjectPartnerInvitation[]
+  bids        Bid[]
+  commissions Commission[]
+  documents   Document[]
+  maintenanceContracts MaintenanceContract[]
+  maintenanceRequests  MaintenanceRequest[]
+
+  @@index([tenantId, partnerType])
+  @@index([tenantId, verificationStatus])
+  @@map("partners")
+}
+
+model PartnerService {
+  id       String  @id @default(uuid())
+  tenantId String  @map("tenant_id")
+  tenant   Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  partnerId String @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  serviceType PartnerServiceType @map("service_type")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([partnerId, serviceType])
+  @@map("partner_services")
+}
+
+enum PartnerUserRole {
+  OWNER
+  MANAGER
+  SALES
+  ACCOUNTANT
+  PROJECT_MANAGER
+  ENGINEER
+}
+
+model PartnerUser {
+  id       String  @id @default(uuid())
+  tenantId String  @map("tenant_id")
+  tenant   Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  partnerId String @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  userId    String  @map("user_id")
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      PartnerUserRole @default(OWNER)
+  isPrimary Boolean @default(false) @map("is_primary")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // No global @@unique([userId]): the existing User model already lets one
+  // User hold multiple independent company profiles (Owner + Contractor +
+  // HotelManagementCompany can coexist today via separate unique FKs), so
+  // this doesn't newly forbid one User managing multiple Partners.
+  @@unique([partnerId, userId])
+  @@map("partner_users")
+}
+
+enum DesignPricingApproach {
+  PER_SQM
+  FIXED_FEE
+  HOURLY
+  PERCENTAGE_OF_PROJECT
+  OTHER
+}
+
+model InteriorDesignCompany {
+  id        String  @id @default(uuid())
+  tenantId  String  @map("tenant_id")
+  tenant    Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  partnerId String  @unique @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  companyName String? @map("company_name")
+  designSpecialties String[] @map("design_specialties")
+  designStyles      String[] @map("design_styles")
+  projectTypes      String[] @map("project_types")
+  serviceCities     City[]   @relation("InteriorDesignServiceCities")
+
+  yearsOfExperience Int? @map("years_of_experience")
+  teamSize          Int? @map("team_size")
+
+  capability3dVisualization      Boolean @default(false) @map("capability_3d_visualization")
+  capabilityAutoCad              Boolean @default(false) @map("capability_autocad")
+  capabilityMoodBoard             Boolean @default(false) @map("capability_mood_board")
+  capabilityMaterialSelection    Boolean @default(false) @map("capability_material_selection")
+  capabilityExecutionSupervision Boolean @default(false) @map("capability_execution_supervision")
+  capabilityDesignConsultation   Boolean @default(false) @map("capability_design_consultation")
+
+  pricingApproach   DesignPricingApproach? @map("pricing_approach")
+  minProjectSizeSqm Decimal? @db.Decimal(10, 2) @map("min_project_size_sqm")
+  maxProjectSizeSqm Decimal? @db.Decimal(10, 2) @map("max_project_size_sqm")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("interior_design_companies")
+}
+
+enum LeadSource {
+  PARTNER_REFERRAL
+  WEBSITE
+  FACEBOOK
+  INSTAGRAM
+  WHATSAPP
+  COLD_CALL
+  ADMIN
+  EXISTING_CUSTOMER
+  GOOGLE
+  ORGANIC
+  DIRECT
+  OTHER
+}
+enum LeadStatus {
+  NEW
+  CONTACTED
+  INTERESTED
+  FOLLOW_UP
+  VIEWING
+  BOOKED
+  NOT_INTERESTED
+  NO_RESPONSE
+  QUALIFIED
+  CONVERTED
+  LOST
+  DO_NOT_CONTACT
+}
+enum LeadPropertyStatus {
+  NOT_REGISTERED
+  REGISTRATION_STARTED
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  ACTIVE
+}
+enum DuplicateReviewStatus {
+  PENDING
+  CONFIRMED_DUPLICATE
+  CONFIRMED_DISTINCT
+  DISPUTED
+}
+model Lead {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  source    LeadSource
+  partnerId String?  @map("partner_id")
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: Restrict)
+
+  // Marketing attribution (Item 12) — nullable, only populated when a lead
+  // originates from a published Advertisement rather than the partner-CRM
+  // flow this model was originally built for.
+  advertisementId String? @map("advertisement_id")
+  advertisement   Advertisement? @relation(fields: [advertisementId], references: [id], onDelete: SetNull)
+  campaignId String? @map("campaign_id")
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  utmSource   String? @map("utm_source")
+  utmMedium   String? @map("utm_medium")
+  utmCampaign String? @map("utm_campaign")
+
+  fullName String @map("full_name")
+  phone    String
+  whatsappNumber String? @map("whatsapp_number")
+  email    String?
+  governorate String?
+  cityId   String? @map("city_id")
+  city     City?   @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  address  String?
+
+  leadStatus     LeadStatus @default(NEW) @map("lead_status")
+  propertyStatus LeadPropertyStatus @default(NOT_REGISTERED) @map("property_status")
+
+  assignedEmployeeId String? @map("assigned_employee_id")
+  assignedEmployee   User?   @relation("LeadsAssigned", fields: [assignedEmployeeId], references: [id], onDelete: SetNull)
+
+  convertedOwnerId String? @map("converted_owner_id")
+  convertedOwner   Owner?  @relation(fields: [convertedOwnerId], references: [id], onDelete: SetNull)
+
+  duplicateOfLeadId String? @map("duplicate_of_lead_id")
+  duplicateOfLead   Lead?   @relation("LeadDuplicates", fields: [duplicateOfLeadId], references: [id], onDelete: SetNull)
+  duplicateLeads    Lead[]  @relation("LeadDuplicates")
+  duplicateReviewStatus DuplicateReviewStatus? @map("duplicate_review_status")
+
+  notes         String?   @db.Text
+  lastContactAt DateTime? @map("last_contact_at")
+  nextFollowUpAt DateTime? @map("next_follow_up_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  // No deletedAt, no delete endpoint, ever, for this model — this absence
+  // is the actual mechanism enforcing "never delete leads," not merely a
+  // service-layer convention.
+
+  events      LeadEvent[]
+  followUps   FollowUp[]
+  partnerReferral PartnerReferral?
+
+  @@index([tenantId, leadStatus])
+  @@index([tenantId, partnerId])
+  @@index([tenantId, phone])
+  @@map("leads")
+}
+
+model LeadEvent {
+  id     String @id @default(uuid())
+  leadId String @map("lead_id")
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  eventType   String
+  description String  @db.Text
+  actorUserId String? @map("actor_user_id")
+  actorUser   User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  metadata Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([leadId])
+  @@map("lead_events")
+}
+
+enum FollowUpReason {
+  NOT_READY
+  NEEDS_FINANCING
+  NEEDS_FINISHING
+  NEEDS_FAMILY_APPROVAL
+  WAITING_FOR_CONSTRUCTION
+  COMPARING_ALTERNATIVES
+  PRICE_CONCERN
+  WANTS_TO_RENT_LATER
+  OTHER
+}
+model FollowUp {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  leadId   String @map("lead_id")
+  lead     Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  dueAt   DateTime @map("due_at")
+  reason  FollowUpReason
+  notes   String?
+  completedAt DateTime? @map("completed_at")
+  assignedToUserId String? @map("assigned_to_user_id")
+  assignedToUser   User?   @relation(fields: [assignedToUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId, dueAt])
+  @@map("follow_ups")
+}
+
+enum PartnerReferralDirection {
+  PARTNER_TO_EGYMOTELZ
+  EGYMOTELZ_TO_PARTNER
+}
+enum PartnerReferralStatus {
+  ACTIVE
+  CONVERTED
+  EXPIRED
+  DISPUTED
+  CANCELLED
+}
+
+enum ReferralLifecycleStage {
+  REFERRED
+  REGISTERED
+  VERIFIED
+  PROPERTY_SUBMITTED
+  PROPERTY_APPROVED
+  UNIT_APPROVED
+  ACTIVE
+}
+model PartnerReferral {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  referralCode String @unique @map("referral_code")
+  direction    PartnerReferralDirection
+
+  partnerId String  @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Restrict)
+
+  leadId String? @unique @map("lead_id")
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  projectOpportunityId String? @map("project_opportunity_id")
+  projectOpportunity   ProjectOpportunity? @relation(fields: [projectOpportunityId], references: [id], onDelete: SetNull)
+
+  ownerId    String? @map("owner_id")
+  owner      Owner?  @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  propertyId String? @map("property_id")
+  property   Property? @relation(fields: [propertyId], references: [id], onDelete: SetNull)
+
+  status PartnerReferralStatus @default(ACTIVE)
+
+  // Item 4: the granular Owner-side lifecycle, tracked separately from
+  // `status` above (which remains the referral's own commercial
+  // active/expired/disputed state, unchanged). Once ownerLifecycleStage
+  // reaches PROPERTY_SUBMITTED, the referral becomes locked (see below) —
+  // enforced at the service layer, not by the schema itself.
+  ownerLifecycleStage ReferralLifecycleStage @default(REFERRED) @map("owner_lifecycle_stage")
+  lockedAt DateTime? @map("locked_at")
+  lockedBy String?   @map("locked_by")
+
+  // Server-computed and snapshotted at creation only — no controller ever
+  // accepts these two as client input after creation. A later
+  // SystemSetting("partner.referral_protection_months") change never
+  // retroactively alters an already-issued referral's protection window.
+  protectionMonths    Int      @map("protection_months")
+  protectionExpiresAt DateTime @map("protection_expires_at")
+  attributionSource   String?  @map("attribution_source")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  events      PartnerReferralEvent[]
+  commissions Commission[]
+
+  @@index([tenantId, partnerId])
+  @@index([tenantId, status])
+  @@map("partner_referrals")
+}
+
+model PartnerReferralEvent {
+  id                String @id @default(uuid())
+  partnerReferralId String @map("partner_referral_id")
+  partnerReferral   PartnerReferral @relation(fields: [partnerReferralId], references: [id], onDelete: Cascade)
+  eventType   String
+  description String  @db.Text
+  actorUserId String? @map("actor_user_id")
+  actorUser   User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  metadata Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([partnerReferralId])
+  @@map("partner_referral_events")
+}
+
+enum ProjectExecutionType {
+  COMPETITIVE
+  DIRECT_MATCH
+}
+enum ProjectOpportunityStatus {
+  DRAFT
+  OPEN_FOR_BIDS
+  BIDDING_CLOSED
+  EVALUATING
+  SHORTLISTED
+  AWARDED
+  CANCELLED
+}
+model ProjectOpportunity {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  opportunityCode String @unique @map("opportunity_code")
+  ownerId    String  @map("owner_id")
+  owner      Owner   @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  propertyId String? @map("property_id")
+  property   Property? @relation(fields: [propertyId], references: [id], onDelete: SetNull)
+
+  // Category of company needed — intentionally PartnerType (matched at
+  // invitation time), not PartnerServiceType (a partner's own declared
+  // service list, separate metadata — see PartnerService above).
+  serviceType    PartnerType          @map("service_type")
+  executionType  ProjectExecutionType @map("execution_type")
+
+  title       String
+  description String  @db.Text
+  estimatedBudget Decimal? @db.Decimal(12, 2) @map("estimated_budget")
+  currency    String  @default("EGP")
+  requiredCompletionDate DateTime? @map("required_completion_date")
+  locationCityId String? @map("location_city_id")
+  locationCity   City?  @relation(fields: [locationCityId], references: [id], onDelete: SetNull)
+  areaSqm     Decimal? @db.Decimal(10, 2) @map("area_sqm")
+  unitCount   Int?     @map("unit_count")
+  specialRequirements String? @db.Text @map("special_requirements")
+
+  status      ProjectOpportunityStatus @default(DRAFT)
+  bidDeadline DateTime? @map("bid_deadline")
+
+  awardedBidId String? @unique @map("awarded_bid_id")
+  awardedBid   Bid?    @relation("AwardedBid", fields: [awardedBidId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  createdBy String?  @map("created_by")
+
+  invitations      ProjectPartnerInvitation[]
+  bids             Bid[]             @relation("OpportunityBids")
+  partnerReferrals PartnerReferral[]
+  commissions      Commission[]
+  documents        Document[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, serviceType])
+  @@map("project_opportunities")
+}
+
+enum InvitationStatus {
+  INVITED
+  VIEWED
+  ACCEPTED
+  DECLINED
+  EXPIRED
+}
+model ProjectPartnerInvitation {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  projectOpportunityId String @map("project_opportunity_id")
+  projectOpportunity   ProjectOpportunity @relation(fields: [projectOpportunityId], references: [id], onDelete: Cascade)
+  partnerId String  @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Restrict)
+
+  status     InvitationStatus @default(INVITED)
+  invitedAt  DateTime @default(now()) @map("invited_at")
+  respondedAt DateTime? @map("responded_at")
+
+  // Private bidding (a partner never seeing another partner's invitation
+  // or bid) is enforced server-side by every partner-facing query filtering
+  // WHERE partnerId = req.partner.id — not by anything in this schema
+  // itself. Flagged here so it isn't lost before the Phase 4 controllers.
+  @@unique([projectOpportunityId, partnerId])
+  @@map("project_partner_invitations")
+}
+
+enum BidStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  SHORTLISTED
+  REJECTED
+  WINNING
+  WITHDRAWN
+  EXPIRED
+}
+model Bid {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  projectOpportunityId String @map("project_opportunity_id")
+  projectOpportunity   ProjectOpportunity @relation("OpportunityBids", fields: [projectOpportunityId], references: [id], onDelete: Cascade)
+  partnerId String  @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Restrict)
+
+  status BidStatus @default(DRAFT)
+
+  totalPrice Decimal @db.Decimal(12, 2) @map("total_price")
+  currency   String  @default("EGP")
+  estimatedDurationDays Int? @map("estimated_duration_days")
+  proposedStartDate     DateTime? @map("proposed_start_date")
+  paymentSchedule String? @db.Text @map("payment_schedule")
+  scopeOfWork     String? @db.Text @map("scope_of_work")
+  materialsSpec   String? @db.Text @map("materials_spec")
+  warrantyMonths  Int?    @map("warranty_months")
+  notes           String? @db.Text
+
+  // Interior-design-relevant fields — nullable and generic enough that a
+  // Contractor's bid simply leaves them unset. One Bid model, not a
+  // parallel "InteriorDesignBid" — this is what lets them compete equally.
+  designFee               Decimal? @db.Decimal(12, 2) @map("design_fee")
+  executionSupervisionFee Decimal? @db.Decimal(12, 2) @map("execution_supervision_fee")
+  conceptDesignIncluded    Boolean @default(false) @map("concept_design_included")
+  moodBoardIncluded        Boolean @default(false) @map("mood_board_included")
+  visualization3dIncluded  Boolean @default(false) @map("visualization_3d_included")
+  autoCadDrawingsIncluded  Boolean @default(false) @map("autocad_drawings_included")
+  revisionsIncluded        Int?    @map("revisions_included")
+
+  submittedAt DateTime? @map("submitted_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  awardedForOpportunity ProjectOpportunity? @relation("AwardedBid")
+  commissions Commission[]
+  documents   Document[]
+
+  @@unique([projectOpportunityId, partnerId])
+  @@map("bids")
+}
+
+enum CommissionRuleType {
+  PERCENTAGE
+  FIXED
+}
+model CommissionRule {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  direction   PartnerReferralDirection
+  partnerType PartnerType?   @map("partner_type") // null = applies to all types; set = type-specific override
+  ruleType    CommissionRuleType @map("rule_type")
+  percentageValue Decimal? @db.Decimal(5, 2) @map("percentage_value")
+  fixedAmount     Decimal? @db.Decimal(12, 2) @map("fixed_amount")
+  currency    String  @default("EGP")
+  isActive    Boolean @default(true) @map("is_active")
+  effectiveFrom DateTime @default(now()) @map("effective_from")
+  effectiveTo   DateTime? @map("effective_to")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  createdBy String? @map("created_by")
+
+  commissions Commission[]
+
+  @@index([tenantId, direction, isActive])
+  @@map("commission_rules")
+}
+
+enum CommissionStatus {
+  PENDING
+  ELIGIBLE
+  APPROVED
+  PROCESSING
+  PAID
+  CANCELLED
+  DISPUTED
+}
+model Commission {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  partnerId String  @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Restrict)
+  direction PartnerReferralDirection
+
+  partnerReferralId    String? @map("partner_referral_id")
+  partnerReferral      PartnerReferral?    @relation(fields: [partnerReferralId], references: [id], onDelete: SetNull)
+  projectOpportunityId String? @map("project_opportunity_id")
+  projectOpportunity   ProjectOpportunity? @relation(fields: [projectOpportunityId], references: [id], onDelete: SetNull)
+  bidId String? @map("bid_id")
+  bid   Bid?   @relation(fields: [bidId], references: [id], onDelete: SetNull)
+  commissionRuleId String? @map("commission_rule_id")
+  commissionRule   CommissionRule? @relation(fields: [commissionRuleId], references: [id], onDelete: SetNull)
+
+  baseAmount          Decimal  @db.Decimal(12, 2) @map("base_amount")
+  percentageApplied   Decimal? @db.Decimal(5, 2)  @map("percentage_applied")
+  fixedAmountApplied  Decimal? @db.Decimal(12, 2) @map("fixed_amount_applied")
+  calculatedAmount    Decimal  @db.Decimal(12, 2) @map("calculated_amount")
+  currency            String   @default("EGP")
+
+  // Once status reaches APPROVED or PAID, baseAmount/percentageApplied/
+  // fixedAmountApplied/calculatedAmount/currency/partnerId/direction become
+  // immutable — enforced at the service layer (no controller UPDATE path
+  // touches these fields past that threshold). No existing adjustment-
+  // ledger pattern was found elsewhere in this schema to mirror
+  // (FinancialTransaction is a flat log, not a reversal mechanism) — a
+  // future CommissionAdjustment model is the intended extension point if a
+  // correction is ever needed, deliberately not built now.
+  status       CommissionStatus @default(PENDING)
+  eligibleAt   DateTime? @map("eligible_at")
+  approvedAt   DateTime? @map("approved_at")
+  approvedBy   String?   @map("approved_by")
+  paidAt       DateTime? @map("paid_at")
+  paymentReference String? @map("payment_reference")
+  notes        String?   @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId, partnerId, status])
+  @@index([tenantId, direction])
+  @@map("commissions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 5. MARKETING — ADVERTISEMENTS, CAMPAIGNS
+//
+// Price/amenities are deliberately NOT duplicated here — the public
+// apartment page reads Unit.pricePerNight and Unit.amenities directly at
+// render time, per the explicit "use the existing pricing structure"
+// instruction. Gallery images reference existing, already-approved
+// UnitImage rows (isProfessional + reviewStatus, from the document-review
+// work earlier this session) rather than a second image system.
+// ─────────────────────────────────────────────────────────────────────────
+
+enum AdvertisementStatus {
+  DRAFT
+  PENDING_REVIEW
+  PUBLISHED
+  PAUSED
+  EXPIRED
+  REJECTED
+}
+
+model Advertisement {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  unitId String @map("unit_id")
+  unit   Unit   @relation(fields: [unitId], references: [id], onDelete: Cascade)
+
+  title            String
+  shortDescription String? @map("short_description")
+  fullDescription  String? @db.Text @map("full_description")
+  // Public URL: /apartments/{property.city.key}/{slug} — city segment is
+  // derived at request time from the unit's property/city, not stored here.
+  slug String @map("slug")
+
+  coverImageId String?   @map("cover_image_id")
+  coverImage   UnitImage? @relation("AdvertisementCoverImage", fields: [coverImageId], references: [id], onDelete: SetNull)
+  galleryImages AdvertisementImage[]
+
+  featured   Boolean @default(false)
+  campaignId String? @map("campaign_id")
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  seoTitle       String? @map("seo_title")
+  seoDescription String? @map("seo_description")
+  canonicalUrl   String? @map("canonical_url")
+
+  status      AdvertisementStatus @default(DRAFT)
+  publishedAt DateTime? @map("published_at")
+  expiresAt   DateTime? @map("expires_at")
+
+  createdBy  String? @map("created_by")
+  reviewedBy String? @map("reviewed_by")
+  reviewedAt DateTime? @map("reviewed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  leads Lead[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId, status])
+  @@index([tenantId, unitId])
+  @@map("advertisements")
+}
+
+// Gallery ordering join — references existing, already-reviewed UnitImage
+// rows rather than storing image data a second time.
+model AdvertisementImage {
+  id              String        @id @default(uuid())
+  advertisementId String        @map("advertisement_id")
+  advertisement   Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
+  unitImageId     String        @map("unit_image_id")
+  unitImage       UnitImage     @relation(fields: [unitImageId], references: [id], onDelete: Cascade)
+  sortOrder       Int           @default(0) @map("sort_order")
+
+  @@unique([advertisementId, unitImageId])
+  @@map("advertisement_images")
+}
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+model Campaign {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  name        String
+  startDate   DateTime  @map("start_date")
+  endDate     DateTime? @map("end_date")
+  status      CampaignStatus @default(DRAFT)
+  budget      Decimal? @db.Decimal(12, 2)
+  trackingId  String?  @map("tracking_id") // matches Lead.utmCampaign for attribution
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  createdBy String?  @map("created_by")
+
+  advertisements Advertisement[]
+  leads          Lead[]
+
+  @@index([tenantId, status])
+  @@map("campaigns")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 6. MAINTENANCE — CONTRACTS AND REQUESTS
+//
+// MaintenanceRequest is a new, purpose-built model (Conflict 5) rather than
+// repurposing SupportTicket, whose shape (generic subject + coarse status,
+// no property/unit/partner linkage) doesn't fit this workflow — but it can
+// optionally link one SupportTicket to reuse the existing message thread
+// UI instead of building a second one.
+// ─────────────────────────────────────────────────────────────────────────
+
+enum MaintenanceContractType {
+  MONTHLY
+  ANNUAL
+  PER_VISIT
+  ON_DEMAND
+  CUSTOM
+}
+
+enum MaintenanceContractStatus {
+  DRAFT
+  PENDING_APPROVAL
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+  TERMINATED
+}
+
+model MaintenanceContract {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  // Item 15: partner must have the MAINTENANCE capability — enforced at
+  // the service layer (checked against PartnerService), not by this FK.
+  partnerId String  @map("partner_id")
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Restrict)
+  ownerId   String  @map("owner_id")
+  owner     Owner   @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+
+  // Item 16: scope. propertyId set = whole building; units[] set = specific
+  // unit(s) within or across properties; portfolioWide = every property
+  // this Owner has, present or future. All three are independently
+  // optional so any combination the business needs is representable
+  // without inventing a fourth "scope type" enum.
+  propertyId     String?  @map("property_id")
+  property       Property? @relation(fields: [propertyId], references: [id], onDelete: SetNull)
+  portfolioWide  Boolean  @default(false) @map("portfolio_wide")
+  units          MaintenanceContractUnit[]
+
+  contractNumber String @map("contract_number")
+  contractType   MaintenanceContractType @map("contract_type")
+  startDate      DateTime @map("start_date")
+  endDate        DateTime? @map("end_date")
+  scope          String?  @db.Text
+  serviceFrequency String? @map("service_frequency")
+  fee            Decimal  @db.Decimal(12, 2)
+  status         MaintenanceContractStatus @default(DRAFT)
+  notes          String?  @db.Text
+
+  createdBy  String?   @map("created_by")
+  approvedBy String?   @map("approved_by")
+  approvedAt DateTime? @map("approved_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  maintenanceRequests MaintenanceRequest[]
+
+  @@unique([tenantId, contractNumber])
+  @@index([tenantId, partnerId])
+  @@index([tenantId, status])
+  @@map("maintenance_contracts")
+}
+
+model MaintenanceContractUnit {
+  id         String @id @default(uuid())
+  contractId String @map("contract_id")
+  contract   MaintenanceContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  unitId     String @map("unit_id")
+  unit       Unit   @relation(fields: [unitId], references: [id], onDelete: Cascade)
+
+  @@unique([contractId, unitId])
+  @@map("maintenance_contract_units")
+}
+
+enum MaintenanceRequestStatus {
+  OPEN
+  ASSIGNED
+  ACCEPTED
+  IN_PROGRESS
+  COMPLETED
+  CONFIRMED
+  CANCELLED
+}
+
+model MaintenanceRequest {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  unitId String @map("unit_id")
+  unit   Unit   @relation(fields: [unitId], references: [id], onDelete: Cascade)
+
+  maintenanceContractId String? @map("maintenance_contract_id")
+  maintenanceContract   MaintenanceContract? @relation(fields: [maintenanceContractId], references: [id], onDelete: SetNull)
+
+  partnerId String? @map("partner_id")
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
+  // Optional link to the existing SupportTicket model — reuses its
+  // Message[] thread instead of building a second messaging system.
+  supportTicketId String?       @unique @map("support_ticket_id")
+  supportTicket   SupportTicket? @relation(fields: [supportTicketId], references: [id], onDelete: SetNull)
+
+  title       String
+  description String? @db.Text
+  status      MaintenanceRequestStatus @default(OPEN)
+
+  assignedAt  DateTime? @map("assigned_at")
+  acceptedAt  DateTime? @map("accepted_at")
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  confirmedAt DateTime? @map("confirmed_at")
+  cancelledAt DateTime? @map("cancelled_at")
+
+  createdBy String? @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([tenantId, status])
+  @@index([tenantId, partnerId])
+  @@index([tenantId, unitId])
+  @@map("maintenance_requests")
+}

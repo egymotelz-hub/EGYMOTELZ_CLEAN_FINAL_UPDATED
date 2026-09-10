@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: egymotelz
+      POSTGRES_PASSWORD: egymotelz
+      POSTGRES_DB: egymotelz
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U egymotelz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    # Used for: rate-limit counters at scale, cached /api/public/platform-stats
+    # (Phase 1 §1.2), and short-lived booking holds (AvailabilityCalendar
+    # rows are the source of truth; Redis is only a fast expiry timer, see
+    # Phase 4 booking workflow).
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql://egymotelz:egymotelz@postgres:5432/egymotelz?schema=public
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  redis_data:
+
+# ── Production topology note (wildcard subdomains) ──
+# In production, put a reverse proxy (nginx, Traefik, or your cloud LB) in
+# front of both services with:
+#   - A wildcard DNS record: *.egymotelz.com -> the proxy's IP
+#   - A wildcard TLS cert covering *.egymotelz.com (e.g. via Let's Encrypt DNS-01)
+#   - The proxy forwards the original Host header unchanged to `backend`/`frontend`
+#     (tenantResolver reads req.headers.host directly — no proxy-side rewriting
+#     needed, just don't strip/replace the Host header).
+# Custom domains (once that onboarding flow is built) additionally need a
+# per-domain TLS cert (e.g. via the proxy's ACME integration) issued after
+# the TenantDomain row's `verifiedAt` is set.
